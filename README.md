@@ -56,7 +56,7 @@ Some features/caveats:
     these additional parameters may be specified (because iSeriesPython
     accepts at most 15 parameters).
 -  Blank rows may be inserted when the value in a particular field changes
-    by specifying 'break on <fieldname>' in the record (not field!) text.
+    by specifying 'break on \<fieldname\>' in the record (not field!) text.
 
 The motivation for this program is to provide a tool for easy generation
 of formatted spreadsheets.
