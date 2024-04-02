@@ -1,5 +1,7 @@
 ### UNDER CONSTRUCTION
 
+# Using 2 spaces between sentences.
+
 # Trying to convert to Python 3, running in PASE. This requires pyodbc.
 # There was some way to connect to the local IBM i without any setup or
 # credentials. I don't remember at the moment, but let's assume I can
@@ -7,11 +9,14 @@
 #
 # Overview: The main thing is converting the RLA to SQL. Also necessary,
 # but minor, is converting Python 2 to 3. Finally, make use of the SQL
-# views instead of doing DSPFFD to an output file.
+# views instead of doing DSPFFD to an output file, if possible. Fly in the
+# ointment: So far I can't find the record-level text anywhere but DSPFFD.
+#
+# Need new usage notes. Need to use some kind of standard doc format.
 
 """Copy data from a physical or logical file to an Excel binary file.
 
-Written by John Yeung.  Last modified 2015-04-29.
+Written by John Yeung.  Last modified 2024-04-01.
 
 Usage (from CL):
     python27/python '/util/cpytoxlsx.py' parm(&pf &xlsx [&A1text &A2text ...])
@@ -79,6 +84,7 @@ import sys
 import re
 from os import system
 from datetime import date, time
+from decimal import Decimal
 
 import pyodbc  # install with yum
 from xlsxwriter.workbook import Workbook  # install with pip
@@ -124,6 +130,20 @@ for group, width in bold_char_groups.items():
     for char in group:
         bold_pixel_widths[char] = width
 
+class SheetInfo(object):
+    def __init__(self):
+        self.fieldlist = []  # fields to include, not necessarily all
+        self.headings = {}
+        self.numformats = {}
+        self.dateflags = {}
+        self.timeflags = {}
+        self.commaflags = {}
+        self.decplaces = {}
+        self.colwidths = {}
+        self.wrapped = {}
+        self.blankzeros = {}
+        self.breakfield = None
+
 ##
 ##  Miscellaneous utilities
 ##
@@ -138,7 +158,27 @@ def qcmdexc(cs, cmd):
         raise RuntimeError(
             f"Error while trying to execute the following command:\n{cmd}")
 
-# TO DO: Flesh this out into a proper SNDMSG wrapper. It should be possible
+def fetch(cs):
+    """Do `fetchall` and post-process the result.
+
+    - Right-trim all strings.
+    - Replace decimals (packed or zoned) with integers if scale is zero.
+    - Return a list of tuples instead of a list of Row objects.
+    """
+    result = cs.fetchall()
+    if result:
+        for row in result:
+            for cx, col in enumerate(cs.description):
+                if row[cx] is None:
+                    continue
+                if col[1] == str:
+                    row[cx] = row[cx].rstrip()
+                elif col[1] == Decimal and col[5] == 0:
+                    row[cx] = int(row[cx])
+        return [tuple(row) for row in result]
+    return result
+
+# TO DO: Flesh this out into a proper SNDMSG wrapper.  It should be possible
 # to determine the current user profile with some SQL view or service.
 def sndmsg(msg):
     print(msg)
@@ -267,6 +307,105 @@ def is_numeric_time(size, editword):
     return size == (6, 0) and editword in ("'  .  .  '", "'  :  :  '")
 
 ##
+##  Process DDS
+##
+
+def sheetinfo(cs, libname, filename):
+    qcmdexc(cs,
+        f"dspffd {libname}/{filename}"
+        ' output(*outfile) outfile(qtemp/dspffdpf)')
+    cs.execute('''
+        select
+            whflde, whftxt, whchd1, whchd2, whchd3, whtext,
+            whfldd, whfldp, whfldb,
+            whecde, whewrd
+        from qtemp.dspffdpf''')
+    all_fields = [t[0] for t in cs.description]
+    s = SheetInfo()
+    s.fieldlist = []  # fields to include in spreadsheet
+    s.headings = {}
+    s.numformats = {}
+    s.dateflags = {}
+    s.timeflags = {}
+    s.commaflags = {}
+    s.decplaces = {}
+    s.colwidths = {}
+    s.wrapped = {}
+    s.blankzeros = {}
+    s.breakfield = None
+
+    for row in fetch(cs):
+        fieldname = row[0]  # column_name in SYSCOLUMNS2
+        fieldtext = row[1]  # column_text in SYSCOLUMNS2
+        colhdg = row[2:5]  # column_heading in SYSCOLUMNS2
+        rcdtext = row[5]  # don't know where to find this other than DSPFFD
+        digits, decimal_places, byte_length = row[6:9]
+        edtcde, edtwrd = row[9:11]
+
+        # Set break field.
+        if s.breakfield is None:
+            match = re.search(r'break on (\S+)', rcdtext, re.IGNORECASE)
+            if match:
+                s.breakfield = match.group(1).upper()
+            if s.breakfield not in all_fields:
+                s.breakfield = ''  # different than None; prevent recalculation
+
+        # Set Excel column heading from DDS headings.  If those are blank,
+        # use the field name instead.  There are special values to exclude
+        # the field entirely or set the Excel column heading to blank.
+        heading = ' '.join(colhdg).strip()
+        if heading.upper() == '*SKIP':
+            continue
+        if heading.upper() in ('*BLANK', '*BLANKS'):
+            heading = ''
+        elif not heading:
+            heading = ''
+        s.fieldlist.append(fieldname)
+        s.headings[fieldname] = heading
+
+        # Set field size and type.
+        if digits:
+            fieldsize = (digits, decimal_places)
+            s.decplaces[fieldname] = fieldsize[1]
+            numeric = True
+        else:
+            fieldsize = byte_length
+            numeric = False
+
+        # Look for number format string.
+        match = re.search(r'format="(.*)"', fieldtext, re.IGNORECASE)
+        if match:
+            numformat = {'num_format': match.group(1)}
+        elif numeric:
+            numformat = editcode(edtcde, decimal_places)
+        else:
+            numformat = None
+        if numformat:
+            s.numformats[fieldname] = numformat
+            s.commaflags[fieldname] = ',' in numformat['num_format']
+
+        # Check whether it looks like a numeric date or time.
+        s.dateflags[fieldname] = is_numeric_date(fieldsize, edtwrd)
+        s.timeflags[fieldname] = is_numeric_time(fieldsize, edtwrd)
+
+        # Look for fixed column width.
+        match = re.search(r'width=([1-9][0-9]*)', fieldtext, re.IGNORECASE)
+        if match:
+            s.colwidths[fieldname] = int(match.group(1))
+
+        # Look for text wrap flag.
+        match = re.search(r'wrap=(\*)?on', fieldtext, re.IGNORECASE)
+        if match:
+            s.wrapped[fieldname] = True
+
+        # Look for zero-suppression flag.
+        match = re.search(r'zero(s|es)?=blanks?', fieldtext, re.IGNORECASE)
+        if match:
+            s.blankzeros[fieldname] = True
+
+    return s
+
+##
 ##  Main logic
 ##
 
@@ -292,209 +431,112 @@ def main():
     conn = pyodbc.connect(dsn='*LOCAL')
     c1 = conn.cursor()
 
+    # Get column headings and formatting information from the DDS.
+    fmt = sheetinfo(c1, libname, filename)
 
-    # Have to figure out something to handle *LIBL. For now, require explicit
-    # library.
-    c1 = 'Some cursor'
-    c1.execute(f"select * from {libname}.{filename}")
-    sndmsg('Opened ' + libname + '/' + filename + ' for reading.')
+    # Create a workbook with one sheet
+    with Workbook(sys.argv[2]) as wb:
+        ws = wb.add_worksheet(filename)
+        rx = 0
 
+        title_style = wb.add_format({'bold': True})
+        header_style = wb.add_format({'bold': True, 'text_wrap': True})
+        date_style = wb.add_format({'num_format': 'm/d/yyyy'})
+        time_style = wb.add_format({'num_format': 'h:mm:ss AM/PM'})
+        text_style = wb.add_format({'num_format': '@'})
+        wrapped_style = wb.add_format({'text_wrap': True})
+        for field, format_dict in fmt.numformats.items():
+            fmt.numformats[field] = wb.add_format(format_dict)
 
-    # Get column headings and formatting information from the DDS
-    qcmdexc(
-        f"dspffd {libname}/{filename}"
-        ' output(*outfile) outfile(qtemp/dspffdpf)')
-    c1.execute('''
-        select whflde, whftxt, whchd1, whchd2, whchd3, whtext
-        from qtemp.dspffdpf''')
+        # Populate first few rows using additional parameters, if provided.
+        # Typically, these rows would be used for report ID, date, and title.
+        if parameters > 2:
+            for arg in sys.argv[3:]:
+                ws.write_string(rx, 0, arg, title_style)
+                rx += 1
+            rx += 1  # skip a row before starting the column headings
 
-    fieldlist = [t[0] for t in c1.description]
-    headings = {}
-    numformats = {}
-    dateflags = {}
-    timeflags = {}
-    commaflags = {}
-    decplaces = {}
-    colwidths = {}
-    wrapped = {}
-    blankzeros = {}
-    breakfield = None
-    cmd = f"dspffd {libname}/{filename} output(*outfile) outfile(qtemp/dspffdpf)"
-# Use QCMDEXC to execute the command.
-c2 = 'Some other cursor'
-c2.execute('select * from qtemp.dspffdpf')
-ddsfile = c2.fetch()  # assumes `fetch` is a nice wrapper for `fetchall`
+        # Keep track of the widest data in each column.
+        maxwidths = [0] * len(fmt.fieldlist)
 
-ddsfile.posf()
-while not ddsfile.readn():
-    fieldname = ddsfile['WHFLDE']  # column_name
-    fieldtext = ddsfile['WHFTXT']  # column_text
-    rcdtext = ddsfile['WHTEXT']  # don't know where to find this other than DSPFFD
-    if breakfield is None:
-        match = re.search(r'break on (\S+)', rcdtext, re.IGNORECASE)
-        if match:
-            breakfield = match.group(1).upper()
-        if breakfield not in infile.fieldList():
-            breakfield = ''  # different than None; prevent recalculation
+        # Create a row for column headings.
+        for col, name in enumerate(fmt.fieldlist):
+            desc = fmt.headings[name]
+            ws.write_string(rx, col, desc, header_style)
+            if name not in fmt.colwidths:
+                maxwidths[col] = textwidth(desc, bold=True)
 
-    # Set heading
-    headertuple = (ddsfile['WHCHD1'], ddsfile['WHCHD2'], ddsfile['WHCHD3'])
-    text = ' '.join(headertuple).strip()
-    if not text:
-        text = fieldname
-    elif text.upper() in ('*BLANK', '*BLANKS'):
-        text = ''
-    elif text.upper() == '*SKIP':
-        continue
-    fieldlist.append(fieldname)
-    headings[fieldname] = text
+        bx = None  # ordinal position of break field
+        breakvalue = None
+        if fmt.breakfield:
+            bx = fmt.fieldlist.index(fmt.breakfield)
 
-    # Get field size and type
-    if ddsfile['WHFLDD']:
-        fieldsize = (ddsfile['WHFLDD'], ddsfile['WHFLDP'])
-        decplaces[fieldname] = fieldsize[1]
-        numeric = True
-    else:
-        fieldsize = ddsfile['WHFLDB']
-        numeric = False
+        # Read from database and write to spreadsheet, row by row.
+        c1.execute(f"select * from {libname}.{filename}")
+        sndmsg('Opened ' + libname + '/' + filename + ' for reading.')
 
-    # Look for number format string
-    match = re.search(r'format="(.*)"', fieldtext, re.IGNORECASE)
-    if match:
-        numformat = {'num_format': match.group(1)}
-    elif numeric:
-        numformat = editcode(ddsfile['WHECDE'], ddsfile['WHFLDP'])
-    else:
-        numformat = None
-    if numformat:
-        numformats[fieldname] = numformat
-        commaflags[fieldname] = ',' in numformat['num_format']
+        for row in fetch(c1):
+            rx += 1
+            if bx is not None:
+                if row[bx] != breakvalue and breakvalue is not None:
+                    rx += 1
+                breakvalue = row[bx]
+            for cx, value in enumerate(row):
+                fieldname = fmt.fieldlist[cx]
+                nativedate = False
+                nativetime = False
+                if isinstance(value, date):
+                    ws.write_datetime(rx, cx, value, date_style)
+                    nativedate = True
+                elif isinstance(value, time):
+                    ws.write_datetime(rx, cx, value, time_style)
+                    nativetime = True
+                elif fmt.dateflags[fieldname]:
+                    if value:
+                        year, md = divmod(value, 10000)
+                        month, day = divmod(md, 100)
+                        ws.write_datetime(
+                            rx, cx, date(year, month, day), date_style)
+                elif fmt.timeflags[fieldname]:
+                    if value:
+                        hour, minsec = divmod(value, 10000)
+                        minute, second = divmod(minsec, 100)
+                        ws.write_datetime(
+                            rx, cx, time(hour, minute, second), time_style)
+                elif value == 0 and fieldname in fmt.blankzeros:
+                    pass
+                elif fieldname in fmt.numformats:
+                    ws.write(rx, cx, value, fmt.numformats[fieldname])
+                elif fieldname in fmt.wrapped:
+                    ws.write(rx, cx, value, wrapped_style)
+                elif isinstance(value, str):
+                    ws.write_string(rx, cx, value, text_style)
+                else:
+                    ws.write(rx, cx, value)
+                if fieldname not in fmt.colwidths:
+                    if nativedate or fmt.dateflags[fieldname]:
+                        maxwidths[cx] = datewidth()
+                    elif nativetime or fmt.timeflags[fieldname]:
+                        maxwidths[cx] = timewidth()
+                    if fieldname in fmt.decplaces:
+                        dp = fmt.decplaces[fieldname]
+                        cf = fmt.commaflags[fieldname]
+                        maxwidths[cx] = max(maxwidths[cx], numwidth(value, dp, cf))
+                    else:
+                        maxwidths[cx] = max(maxwidths[cx], textwidth(value))
 
-    # Check whether it looks like a numeric date or time
-    dateflags[fieldname] = is_numeric_date(fieldsize, ddsfile['WHEWRD'])
-    timeflags[fieldname] = is_numeric_time(fieldsize, ddsfile['WHEWRD'])
-
-    # Look for fixed column width
-    match = re.search(r'width=([1-9][0-9]*)', fieldtext, re.IGNORECASE)
-    if match:
-        colwidths[fieldname] = int(match.group(1))
-
-    # Look for text wrap flag
-    match = re.search(r'wrap=(\*)?on', fieldtext, re.IGNORECASE)
-    if match:
-        wrapped[fieldname] = True
-
-    # Look for zero-suppression flag
-    match = re.search(r'zero(s|es)?=blanks?', fieldtext, re.IGNORECASE)
-    if match:
-        blankzeros[fieldname] = True
-
-ddsfile.close()
-
-# Create a workbook with one sheet
-wb = Workbook(sys.argv[2])
-ws = wb.add_worksheet(infile.fileName())
-row = 0
-
-title_style = wb.add_format({'bold': True})
-header_style = wb.add_format({'bold': True, 'text_wrap': True})
-date_style = wb.add_format({'num_format': 'm/d/yyyy'})
-time_style = wb.add_format({'num_format': 'h:mm:ss AM/PM'})
-text_style = wb.add_format({'num_format': '@'})
-wrapped_style = wb.add_format({'text_wrap': True})
-for field, format_dict in numformats.items():
-    numformats[field] = wb.add_format(format_dict)
-
-# Populate first few rows using additional parameters, if provided.
-# Typically, these rows would be used for report ID, date, and title.
-if parameters > 2:
-    for arg in sys.argv[3:]:
-        ws.write_string(row, 0, arg, title_style)
-        row += 1
-    row += 1  # skip a row before starting the column headings
-
-# Keep track of the widest data in each column
-maxwidths = [0] * len(fieldlist)
-
-# Create a row for column headings
-for col, name in enumerate(fieldlist):
-    desc = headings[name]
-    ws.write_string(row, col, desc, header_style)
-    if name not in colwidths:
-        maxwidths[col] = textwidth(desc, bold=True)
-
-breakvalue = None
-infile.posf()
-while not infile.readn():
-    row += 1
-    if breakfield:
-        if infile[breakfield] != breakvalue and breakvalue is not None:
-            row += 1
-        breakvalue = infile[breakfield]
-    for col, data in enumerate(infile.get(fieldlist)):
-        fieldname = fieldlist[col]
-        nativedate = False
-        nativetime = False
-        if infile.fieldType(fieldname) == 'DATE':
-            # A native date is read by iSeriesPython as a formatted
-            # string.  By default, *ISO format is used, but this can be
-            # altered by the DATFMT and DATSEP keywords.  For now,
-            # this program only handles *ISO.
-            year, month, day = [int(x) for x in data.split('-')]
-            if year > 1904:
-                ws.write_datetime(
-                    row, col, date(year, month, day), date_style)
-            nativedate = True
-        elif infile.fieldType(fieldname) == 'TIME':
-            # A native time is read by iSeriesPython as a formatted
-            # string.  By default, *ISO format is used, but this can be
-            # altered by the TIMFMT and TIMSEP keywords.  For now,
-            # this program only handles *ISO.
-            hour, minute, second = [int(x) for x in data.split('.')]
-            ws.write_datetime(
-                row, col, time(hour, minute, second), time_style)
-            nativetime = True
-        elif dateflags[fieldname]:
-            if data:
-                year, md = divmod(data, 10000)
-                month, day = divmod(md, 100)
-                ws.write_datetime(
-                    row, col, date(year, month, day), date_style)
-        elif timeflags[fieldname]:
-            if data:
-                hour, minsec = divmod(data, 10000)
-                minute, second = divmod(minsec, 100)
-                ws.write_datetime(
-                    row, col, time(hour, minute, second), time_style)
-        elif data == 0 and fieldname in blankzeros:
-            pass
-        elif fieldname in numformats:
-            ws.write(row, col, data, numformats[fieldname])
-        elif fieldname in wrapped:
-            ws.write(row, col, data, wrapped_style)
-        elif infile.fieldType(fieldname) == 'CHAR':
-            ws.write_string(row, col, data, text_style)
-        else:
-            ws.write(row, col, data)
-        if fieldname not in colwidths:
-            if nativedate or dateflags[fieldname]:
-                maxwidths[col] = datewidth()
-            elif nativetime or timeflags[fieldname]:
-                maxwidths[col] = timewidth()
-            if fieldname in decplaces:
-                dp = decplaces[fieldname]
-                cf = commaflags[fieldname]
-                maxwidths[col] = max(maxwidths[col], numwidth(data, dp, cf))
+        # Set column widths
+        for cx in range(len(fmt.fieldlist)):
+            if fmt.fieldlist[cx] in fmt.colwidths:
+                ws.set_column(cx, cx, fmt.colwidths[fmt.fieldlist[cx]])
             else:
-                maxwidths[col] = max(maxwidths[col], textwidth(data))
-infile.close()
+                ws.set_column(cx, cx, maxwidths[cx])
 
-# Set column widths
-for col in range(len(fieldlist)):
-    if fieldlist[col] in colwidths:
-        ws.set_column(col, col, colwidths[fieldlist[col]])
-    else:
-        ws.set_column(col, col, maxwidths[col])
+        sndmsg('File copied to ' + sys.argv[2] + '.')
 
-wb.close()
-sndmsg('File copied to ' + sys.argv[2] + '.')
+##
+##  Script entry point
+##
+
+if __name__ == '__main__':
+    main()
