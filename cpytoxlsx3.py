@@ -1,72 +1,85 @@
-### UNDER CONSTRUCTION
-
-# Using 2 spaces between sentences.
-
-# Trying to convert to Python 3, running in PASE. This requires pyodbc.
-# There was some way to connect to the local IBM i without any setup or
-# credentials. I don't remember at the moment, but let's assume I can
-# find that out easily enough.
-#
-# Overview: The main thing is converting the RLA to SQL. Also necessary,
-# but minor, is converting Python 2 to 3. Finally, make use of the SQL
-# views instead of doing DSPFFD to an output file, if possible. Fly in the
-# ointment: So far I can't find the record-level text anywhere but DSPFFD.
-#
-# Need new usage notes. Need to use some kind of standard doc format.
-
 """Copy data from a physical or logical file to an Excel binary file.
 
-Written by John Yeung.  Last modified 2024-04-01.
+Written by John Yeung.  Last modified 2024-04-12.
 
-Usage (from CL):
-    python27/python '/util/cpytoxlsx.py' parm(&pf &xlsx [&A1text &A2text ...])
+Usage (assuming Richard Schoen's QshOni is installed):
+    qshoni/qshpyrun &script_lib 'cpytoxlsx3.py' (
+        &pf
+        &xlsx
+        [&A1_text
+        &A2_text
+        ...])
+        &py_version
 
-The above assumes this program is located in '/util', and that iSeriesPython
-2.7 is installed.  However, you can put this program anywhere you like in
-the IFS.  You can also probably use iSeriesPython 2.5, but this is not tested
-and not recommended.  The XlsxWriter package is required.  Instructions for
-downloading and installing it can be found at
+Required parameters:
+    &script_lib = IFS directory containing cpytoxlsx3.py
+    &pf = qualified name of file to copy
+    &xlsx = name of workbook to create, including path and extension
+    &py_version = Python version; must be at least 3.6
 
-http://iseriespython.blogspot.ca/2013/06/installing-python-packages-like.html
+Optional parameters:
+    &A1_text = free-form text to appear at the top of the spreadsheet
+    &A2_text = free-form text to appear on the 2nd line of the spreadsheet
 
-Some features/caveats:
+    If using QshOni, the limit is 38 of these (because QSHPYRUN provides up
+    to 40 total arguments to the Python script), with each limited to 200
+    characters.
 
--  Column headings come from the COLHDG values in the DDS.  Multiple
-    values for a single field are joined by spaces, not newlines.  For
-    any fields without a COLHDG, or with only blanks in the COLHDG (these
-    two situations are indistinguishable), the field name is used as the
-    heading (the TEXT keyword is not checked).  To specify a blank column
-    heading rather than the field name, use COLHDG('*BLANK').
--  Column headings wrap and are displayed in bold.
--  Each column is sized approximately according to its longest data,
-    assuming that the default font is Calibri 11, unless a width is
-    specified in the field text (using 'width=<number>').  [For this
-    purpose, the length of numeric data is assumed to always include
-    commas and fixed decimal places.]
--  Each column may be formatted using an Excel format string in the
+Dependencies:
+  - Python 3.6 or later, installed via yum
+  - PyODBC, installed via yum
+  - XlsxWriter, installed via pip
+  - QshOni (see https://github.com/richardschoen/qshoni)
+
+yum can be invoked in a PASE shell or through ACS (go to the Tools menu,
+choose Open Source Package Management).
+
+QshOni is optional, but having it simplifies the Python call.
+
+[To reduce confusion between Excel columns and database table columns,
+DDS-based terminology will be used below unless otherwise noted.]
+
+Features:
+
+  - Column headings come from the field headings (as would be defined
+    by the COLHDG keyword).  If there are multiple lines in a heading,
+    they are trimmed and then joined into one line for the spreadsheet.
+  - For any field without a heading, the field name is used instead.
+    Field text is NOT checked for this purpose.  To specify a blank
+    column heading (and avoid using the field name), define the field
+    with COLHDG('*BLANK').
+  - Column headings wrap and are displayed in bold.
+
+  - Each column is sized approximately according to its longest data,
+    assuming that the font is Calibri 11, unless a width is specified
+    in the field text (using 'width=<number>').  [For this purpose,
+    the length of numeric data is assumed to always include commas and
+    fixed decimal places.]
+  - Numeric data may be formatted using an Excel format string in the
     field text (using 'format="<string>"').
--  Columns with a supported EDTCDE value but no format string are
-    formatted according to the edit code.
--  Character fields with no format string and no edit code are set to
-    Excel text format.
--  Columns may specify 'zero=blank' anywhere in the field text to leave
-    a cell empty when its value is zero.  (This is different than using
-    a format string or edit code to hide zero values.  See the ISBLANK
+  - If there is no format string, but the field has a supported EDTCDE
+    value, the column will be formatted according to the edit code.
+    The supported edit codes are 1, 2, 3, 4, N, O, P, and Q.
+  - For fields defined as character, the column will be set to Excel
+    text format (to make it harder to accidentally convert digit-only
+    character data into numeric by "visiting" the cell in Excel).
+  - If 'zero=blank' is specified in the field text, cells which would
+    have been zero are empty instead.  (This is different than using a
+    format string or edit code to hide zero values.  See the ISBLANK
     and ISNUMBER functions in Excel.)
--  Columns may specify 'wrap=on' anywhere in the field text to wrap
-    the contents.  This will automatically adjust the row height to
-    accommodate multiple lines of text within the cell.
--  Columns may be skipped entirely by specifying COLHDG('*SKIP')
--  Numeric fields that are 8 digits long with no decimal places are
+  - If 'wrap=on' is specified in the field text, the contents of the
+    cell will wrap.  The row height is adjusted automatically to
+    accommodate multiple lines.
+  - Columns may be skipped entirely by specifying COLHDG('*SKIP').
+  - Numeric fields that are 8 digits long with no decimal places are
     automatically converted to dates if they have a suitable edit word.
--  Numeric fields that are 6 digits long with no decimal places are
+  - Numeric fields that are 6 digits long with no decimal places are
     automatically converted to times if they have a suitable edit word.
--  Free-form data may be inserted at the top using additional parameters,
-    one parameter for each row.  The data will be in bold.  Up to 13 of
-    these additional parameters may be specified (because iSeriesPython
-    accepts at most 15 parameters).
--  Blank rows may be inserted when the value in a particular field changes
-    by specifying 'break on <fieldname>' in the record (not field!) text.
+  - Free-form text inserted at the top using the optional parameters
+    will be displayed in bold.
+  - Blank rows may be inserted when the value in a particular field
+    changes by specifying 'break on <fieldname>' in the record (not
+    field!) text.  (I am not sure this can be done with SQL.)
 
 The motivation for this program is to provide a tool for easy generation
 of formatted spreadsheets.
@@ -83,7 +96,7 @@ use, including meaningful promptability.
 import sys
 import re
 from os import system
-from datetime import date, time
+from datetime import date, time, datetime
 from decimal import Decimal
 
 import pyodbc  # install with yum
@@ -205,13 +218,8 @@ def number_analysis(n, dp=0):
         n = -n
     if dp > 0:
         points = 1
-    if isinstance(n, float):
-        idigits = integer_digits(int(n) + 1)
-    elif isinstance(n, int):
-        idigits = integer_digits(n)
-    else:
-        return None
-    digits = idigits + dp
+    idigits = integer_digits(int(n))
+    digits = idigits + points + dp
     thousands = (idigits - 1) // 3
     return digits, thousands, points, signs
 
@@ -269,6 +277,16 @@ def timewidth(bold=False):
     pixels = 7 + digits_width + sep_width + space_width + am_pm_width
     return colwidth_from_pixels(pixels)
 
+def timestampwidth(bold=False):
+    """Set aside enough width for an MM/DD/YY HH:MM:SS AM/PM timestamp."""
+    charwidths = bold_pixel_widths if bold else pixel_widths
+    digits_width = 12 * charwidths['0']
+    sep_width = 2 * charwidths['/'] + 2 * charwidths[':']
+    space_width = 2 * charwidths[' ']
+    am_pm_width = max(charwidths['A'], charwidths['P']) + charwidths['M']
+    pixels = 7 + digits_width + sep_width + space_width + am_pm_width
+    return colwidth_from_pixels(pixels)
+
 ##
 ##  Number formatting
 ##
@@ -311,6 +329,12 @@ def is_numeric_time(size, editword):
 ##
 
 def sheetinfo(cs, libname, filename):
+    """Retrieve formatting information from DSPFFD.
+
+    It would be nice to use the SQL facilities that are now available,
+    such as QSYS2.SYSCOLUMNS2, but so far I have not been able to find
+    the record text anywhere but DSPFFD.
+    """
     qcmdexc(cs,
         f"dspffd {libname}/{filename}"
         ' output(*outfile) outfile(qtemp/dspffdpf)')
@@ -443,6 +467,7 @@ def main():
         header_style = wb.add_format({'bold': True, 'text_wrap': True})
         date_style = wb.add_format({'num_format': 'm/d/yyyy'})
         time_style = wb.add_format({'num_format': 'h:mm:ss AM/PM'})
+        timestamp_style = wb.add_format({'num_format': 'm/d/yy h:mm:ss AM/PM'})
         text_style = wb.add_format({'num_format': '@'})
         wrapped_style = wb.add_format({'text_wrap': True})
         for field, format_dict in fmt.numformats.items():
@@ -485,7 +510,13 @@ def main():
                 fieldname = fmt.fieldlist[cx]
                 nativedate = False
                 nativetime = False
-                if isinstance(value, date):
+                nativetimestamp = False
+                # When using `isinstance`, class `datetime` has to be checked
+                # before `date` because `datetime` is a subclass of `date`.
+                if isinstance(value, datetime):
+                    ws.write_datetime(rx, cx, value, timestamp_style)
+                    nativetimestamp = True
+                elif isinstance(value, date):
                     ws.write_datetime(rx, cx, value, date_style)
                     nativedate = True
                 elif isinstance(value, time):
@@ -518,6 +549,8 @@ def main():
                         maxwidths[cx] = datewidth()
                     elif nativetime or fmt.timeflags[fieldname]:
                         maxwidths[cx] = timewidth()
+                    elif nativetimestamp:
+                        maxwidths[cx] = timestampwidth()
                     if fieldname in fmt.decplaces:
                         dp = fmt.decplaces[fieldname]
                         cf = fmt.commaflags[fieldname]
